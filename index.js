@@ -343,6 +343,18 @@ async function registroApri(env, creds, args) {
 async function login(page, creds) {
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
   await settle(page);
+  // I campi del login vengono creati via JavaScript: aspetta che compaiano.
+  await page
+    .waitForFunction(
+      () =>
+        [...document.querySelectorAll("input")].filter(
+          (i) =>
+            !["hidden", "checkbox", "radio", "button", "submit"].includes(i.type) &&
+            i.getBoundingClientRect().width > 0
+        ).length >= 2,
+      { timeout: 20000, polling: 500 }
+    )
+    .catch(() => {});
 
   const fields = [];
   for (const el of await page.$$(
@@ -351,7 +363,10 @@ async function login(page, creds) {
     if (await el.boundingBox()) fields.push(el);
   }
   if (fields.length < 2) {
-    throw new Error("Pagina di login non riconosciuta (il sito potrebbe aver bloccato il browser di Cloudflare).");
+    const info = await page
+      .evaluate(() => `titolo: "${document.title}" | testo: ${(document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 400)}`)
+      .catch(() => "");
+    throw new Error(`Pagina di login non riconosciuta (URL: ${page.url()} | ${info})`);
   }
   let pass = null;
   for (const f of fields) {
