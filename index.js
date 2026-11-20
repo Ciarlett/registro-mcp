@@ -1,68 +1,82 @@
-// Server MCP per il registro elettronico registro.orsoline.it (Sigma Sistemi).
-// Gira su Cloudflare Workers e usa Browser Rendering (un vero Chrome in cloud).
-// Collegandolo a un'AI (Claude, ChatGPT, ...) si apre una pagina di accesso dove inserisci
-// le credenziali del registro: vengono verificate sul sito e salvate cifrate (OAuth),
-// senza passare mai dalla chat. Funziona con qualsiasi client MCP che supporti OAuth.
+// Server MCP per il registro elettronico registro.orsoline.it (OneClickSchool / Sigma Sistemi).
+// Usa direttamente l'API REST dell'app ufficiale (nessun browser): login con token Bearer
+// e operazioni via /api/query/esegui. Gira su Cloudflare Workers, gratis e senza limiti di browser.
+//
+// Collegandolo a un'AI si apre una pagina dove inserisci le credenziali del registro:
+// vengono verificate e salvate cifrate (OAuth). L'AI non le vede mai.
 
-import puppeteer from "@cloudflare/puppeteer";
 import { OAuthProvider, AuthorizationError } from "@cloudflare/workers-oauth-provider";
 
-const BASE = "https://registro.orsoline.it";
-const LOGIN_URL = BASE + "/Default.aspx";
-const MAX_TEXT = 20000;
+// Endpoint della scuola (ricavati dalla configurazione dell'app, codice scuola "Dedalo").
+const PURL = "https://registro.orsoline.it/registroWs"; // operazioni registro (voti, assenze, ...)
+const WURL = "https://registro.orsoline.it/oneClickSchoolWs"; // servizi app
+const APP_VERSION = "1.2.39";
+const DEVICE = "android";
 const SUPPORTED_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+// Operazioni note (codice -> parametri accettati). Il valore "studente" viene riempito
+// automaticamente col codice dell'utente autenticato se non specificato.
+const OPERAZIONI = {
+  voti: { codice: "REVOTD_votiStudente", params: ["studente", "materia", "tipo", "nascondiVoti", "periodo"], def: { tipo: "0", nascondiVoti: "0" } },
+  assenze: { codice: "REAPPE_assenzeStudente", params: ["studente"] },
+  compiti: { codice: "RECOMP_elencoStudente", params: ["studente", "mese", "materia"] },
+  argomenti: { codice: "REARGO_elencoStudente", params: ["studente", "mese", "materia"] },
+  comunicazioni: { codice: "RECOMU_elencoComunicazioniStudente", params: ["studente"] },
+  materie: { codice: "RE_getElencoMaterieStudente", params: ["studente"] },
+  periodi: { codice: "RE_getElencoPeriodiStudente", params: ["studente"] },
+  note: { codice: "RENODI_elencoStudente", params: ["studente"] },
+};
 
 const TOOLS = [
   {
-    name: "registro_apri",
-    title: "Apri il registro elettronico",
+    name: "registro",
+    title: "Registro elettronico",
     description:
-      "Accede al registro elettronico della scuola (registro.orsoline.it) con le credenziali dello studente " +
-      "e restituisce: URL corrente, testo della pagina e l'elenco degli elementi cliccabili (voci di menu, link, pulsanti). " +
-      "Senza argomenti mostra la pagina iniziale dopo il login: usala per prima per scoprire il menu. " +
-      "Per arrivare a una sezione (voti, compiti, assenze, comunicazioni...) passa in 'azioni' i clic da fare, in ordine, " +
-      "usando i testi esatti visti nell'elenco degli elementi cliccabili. Ogni chiamata parte da un nuovo login, " +
-      "quindi ripeti tutta la sequenza di clic per arrivare a una sottopagina. " +
-      "Non usare 'scrivi' per inviare giustificazioni, prenotazioni o altri moduli senza conferma esplicita dell'utente.",
+      "Legge i dati dal registro elettronico della scuola (OneClickSchool). " +
+      "Scegli 'cosa': voti, assenze, compiti, argomenti, comunicazioni, materie, periodi, note. " +
+      "Parametri utili: 'materia' (codice materia da 'materie'), 'periodo' (codice da 'periodi'), " +
+      "'mese' (per compiti/argomenti, formato AAAA-MM o MM). " +
+      "Il codice studente è automatico. Restituisce le righe della tabella dati del registro.",
     inputSchema: {
       type: "object",
       properties: {
-        percorso: {
-          type: "string",
-          description: "Facoltativo. URL o percorso del registro da aprire dopo il login, es. '/Default.aspx'.",
-        },
-        azioni: {
-          type: "array",
-          description: "Facoltativo. Azioni da eseguire in ordine dopo il login.",
-          items: {
-            type: "object",
-            properties: {
-              tipo: { type: "string", enum: ["clicca", "scrivi", "attendi"] },
-              testo: {
-                type: "string",
-                description:
-                  "Per 'clicca': il testo visibile dell'elemento. Per 'scrivi': etichetta, placeholder, name o id del campo.",
-              },
-              valore: {
-                type: "string",
-                description: "Per 'scrivi': il testo da inserire o l'opzione da scegliere. Per 'attendi': millisecondi.",
-              },
-            },
-            required: ["tipo"],
-          },
-        },
-        screenshot: {
-          type: "boolean",
-          description: "Facoltativo. Se true allega uno screenshot della pagina finale.",
-        },
+        cosa: { type: "string", enum: Object.keys(OPERAZIONI), description: "Cosa leggere dal registro." },
+        materia: { type: "string", description: "Codice materia (facoltativo)." },
+        periodo: { type: "string", description: "Codice periodo/quadrimestre (facoltativo)." },
+        mese: { type: "string", description: "Mese per compiti/argomenti (facoltativo)." },
+        nascondiVoti: { type: "string", enum: ["0", "1"], description: "Per i voti: 1 nasconde i voti nascosti dal docente." },
       },
+      required: ["cosa"],
+    },
+    annotations: { openWorldHint: true, readOnlyHint: true },
+  },
+  {
+    name: "registro_operazione",
+    title: "Operazione grezza sul registro",
+    description:
+      "Avanzato/diagnostica. Esegue una qualunque operazione dell'API (codice tipo 'REVOTD_votiStudente') " +
+      "con i parametri indicati, e restituisce la risposta grezza del server. Usala per esplorare o correggere.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        codice: { type: "string", description: "Codice operazione, es. REVOTD_votiStudente." },
+        parametri: { type: "object", description: "Coppie nome/valore dei parametri, es. { studente: \"123\", periodo: \"1\" }." },
+        base: { type: "string", enum: ["registroWs", "oneClickSchoolWs"], description: "Base da usare (default registroWs)." },
+      },
+      required: ["codice"],
     },
     annotations: { openWorldHint: true },
   },
+  {
+    name: "registro_account",
+    title: "Info account",
+    description: "Esegue il login e mostra i dati dell'utente autenticato (codice studente, nome, scuola). Utile per diagnostica.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true },
+  },
 ];
 
-// ---------------- OAuth: il provider si crea per l'indirizzo su cui gira il Worker ----------------
-
+// ---------------- OAuth provider ----------------
 const providers = new Map();
 function getProvider(origin) {
   if (!providers.has(origin)) {
@@ -96,10 +110,8 @@ export default {
   },
 };
 
-// ---------------- Pagine: home e accesso ----------------
-
+// ---------------- Pagine ----------------
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
-
 function page(body, headers = new Headers()) {
   headers.set("Content-Type", "text/html; charset=utf-8");
   return new Response(
@@ -111,37 +123,30 @@ h1{font-size:22px;margin:0 0 8px}p{line-height:1.45;color:#4a5263}label{display:
 input{width:100%;box-sizing:border-box;font-size:17px;padding:12px;border:1px solid #c9d0dc;border-radius:10px}
 .row{display:flex;gap:10px;margin-top:20px}button{flex:1;font-size:17px;padding:12px;border-radius:10px;border:0;background:#3f6ea6;color:#fff;font-weight:600}
 button.no{background:#e6e9ef;color:#1d2433}.err{background:#fde8e8;color:#9b1c1c;padding:10px 12px;border-radius:10px}
-.warn{background:#fff6dd;padding:10px 12px;border-radius:10px}code{word-break:break-all}
-</style></head><body><div class="card">${body}</div></body></html>`,
+code{word-break:break-all}</style></head><body><div class="card">${body}</div></body></html>`,
     { headers }
   );
 }
-
-function loginPage(details, handle, error) {
+function loginForm(details, handle, error, user = "") {
   return `<h1>Collega il registro elettronico</h1>
-<p><strong>${esc(details.clientName)}</strong>${details.clientDomain ? ` (${esc(details.clientDomain)})` : ""} chiede di leggere il tuo registro su registro.orsoline.it.
-L'accesso verrà inviato a <strong>${esc(details.redirectHost)}</strong>.</p>
-${details.redirectIsLoopback ? '<p class="warn">Questo invia l\'accesso a un\'app sul tuo computer: continua solo se hai appena avviato il collegamento da lì.</p>' : ""}
+<p><strong>${esc(details.clientName)}</strong>${details.clientDomain ? ` (${esc(details.clientDomain)})` : ""} vuole leggere il tuo registro.</p>
 ${error ? `<p class="err">${esc(error)}</p>` : ""}
 <form method="post">
 <input type="hidden" name="handle" value="${esc(handle)}">
-<label for="u">Username del registro</label><input id="u" name="username" autocomplete="username" autocapitalize="none" required>
+<label for="u">Username del registro</label><input id="u" name="username" value="${esc(user)}" autocomplete="username" autocapitalize="none" required>
 <label for="p">Password del registro</label><input id="p" name="password" type="password" autocomplete="current-password" required>
 <div class="row"><button class="no" name="decision" value="deny" formnovalidate>Annulla</button><button name="decision" value="approve">Collega</button></div>
 </form>
-<p style="font-size:13px">Le credenziali vengono verificate sul registro e salvate cifrate su questo server. L'AI non le vede mai.</p>`;
+<p style="font-size:13px">Le credenziali vengono verificate e salvate cifrate su questo server. L'AI non le vede mai.</p>`;
 }
 
 async function pagesFetch(request, env) {
   const url = new URL(request.url);
   if (url.pathname === "/") {
     return page(`<h1>Registro MCP attivo ✅</h1>
-<p>Per collegarlo a un'AI aggiungi un connettore MCP personalizzato con questo indirizzo:</p>
-<p><code>${esc(url.origin)}/mcp</code></p>
-<p>Al collegamento si aprirà la pagina per inserire le credenziali del registro.</p>`);
+<p>Indirizzo da usare come connettore MCP:</p><p><code>${esc(url.origin)}/mcp</code></p>`);
   }
   if (url.pathname !== "/authorize") return new Response("Not found", { status: 404 });
-
   const oauth = env.OAUTH_PROVIDER;
 
   if (request.method === "GET") {
@@ -154,7 +159,7 @@ async function pagesFetch(request, env) {
     }
     const details = await oauth.describeConsent(authRequest);
     const consent = await oauth.beginConsent(authRequest);
-    return page(loginPage(details, consent.handle), consent.headers);
+    return page(loginForm(details, consent.handle), consent.headers);
   }
 
   if (request.method === "POST") {
@@ -166,25 +171,17 @@ async function pagesFetch(request, env) {
         return new Response(null, { status: 302, headers: denied.headers });
       }
       const creds = { user: String(form.get("username") || "").trim(), pass: String(form.get("password") || "") };
-
-      // Verifica le credenziali sul registro prima di consumare il modulo.
       let error = null;
       try {
-        await verificaCredenziali(env, creds);
+        await apiLogin(creds); // verifica reale
       } catch (err) {
         error = err.message;
       }
       if (error) {
-        return page(
-          `<h1>Accesso non riuscito</h1><p class="err">${esc(error)}</p>
-<form method="post"><input type="hidden" name="handle" value="${esc(handle)}">
-<label for="u">Username del registro</label><input id="u" name="username" value="${esc(creds.user)}" autocapitalize="none" required>
-<label for="p">Password del registro</label><input id="p" name="password" type="password" required>
-<div class="row"><button class="no" name="decision" value="deny" formnovalidate>Annulla</button><button name="decision" value="approve">Riprova</button></div></form>`,
-          new Headers({ "X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'" })
-        );
+        const details = { clientName: "Connettore", clientDomain: "" };
+        return page(loginForm(details, handle, error, creds.user),
+          new Headers({ "X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'" }));
       }
-
       const approved = await oauth.approveConsent(request, handle, { scope: ["registro"] });
       const { redirectTo } = await oauth.completeAuthorization({
         request: approved.request,
@@ -197,7 +194,7 @@ async function pagesFetch(request, env) {
       return new Response(null, { status: 302, headers: approved.headers });
     } catch (err) {
       if (err instanceof AuthorizationError) {
-        return page(`<h1>Pagina scaduta</h1><p class="err">${esc(err.message)}</p><p>Torna all'app e ricollega il connettore.</p>`);
+        return page(`<h1>Pagina scaduta</h1><p class="err">${esc(err.message)}</p>`);
       }
       throw err;
     }
@@ -205,12 +202,9 @@ async function pagesFetch(request, env) {
   return new Response("Method not allowed", { status: 405 });
 }
 
-// ---------------- MCP (Streamable HTTP, senza stato) ----------------
-
+// ---------------- MCP ----------------
 async function mcpFetch(request, env, ctx) {
-  if (request.method !== "POST") {
-    return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
-  }
+  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
   let body;
   try {
     body = await request.json();
@@ -218,330 +212,164 @@ async function mcpFetch(request, env, ctx) {
     return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
   }
   const creds = ctx.props;
-  const messages = Array.isArray(body) ? body : [body];
-  const responses = [];
-  for (const msg of messages) {
-    const res = await handleMessage(msg, env, creds);
-    if (res) responses.push(res);
+  const msgs = Array.isArray(body) ? body : [body];
+  const out = [];
+  for (const m of msgs) {
+    const r = await handle(m, creds);
+    if (r) out.push(r);
   }
-  if (responses.length === 0) return new Response(null, { status: 202 });
-  return json(Array.isArray(body) ? responses : responses[0]);
+  if (out.length === 0) return new Response(null, { status: 202 });
+  return json(Array.isArray(body) ? out : out[0]);
 }
 
-async function handleMessage(msg, env, creds) {
-  if (!msg || typeof msg !== "object" || msg.jsonrpc !== "2.0") {
-    return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid request" } };
-  }
+async function handle(msg, creds) {
+  if (!msg || msg.jsonrpc !== "2.0") return { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid request" } };
   const { id, method, params } = msg;
-  if (id === undefined || id === null) return null; // notifica
-
+  if (id === undefined || id === null) return null;
   const ok = (result) => ({ jsonrpc: "2.0", id, result });
   const fail = (code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
+  const errTool = (m) => ok({ content: [{ type: "text", text: m }], isError: true });
 
   switch (method) {
-    case "initialize": {
-      const requested = params?.protocolVersion;
+    case "initialize":
       return ok({
-        protocolVersion: SUPPORTED_VERSIONS.includes(requested) ? requested : SUPPORTED_VERSIONS[0],
+        protocolVersion: SUPPORTED_VERSIONS.includes(params?.protocolVersion) ? params.protocolVersion : SUPPORTED_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "registro-orsoline", version: "2.0.0" },
-        instructions:
-          "Registro elettronico dello studente. Chiama prima registro_apri senza argomenti per vedere il menu, " +
-          "poi naviga con 'azioni' di tipo 'clicca'. Il piano gratuito ha circa 10 minuti di browser al giorno: evita chiamate inutili.",
+        serverInfo: { name: "registro-orsoline", version: "3.0.0" },
+        instructions: "Registro elettronico via API. Usa lo strumento 'registro' con 'cosa' = voti/compiti/assenze/argomenti/comunicazioni. Niente limiti di browser.",
       });
-    }
     case "ping":
       return ok({});
     case "tools/list":
       return ok({ tools: TOOLS });
     case "tools/call": {
-      if (params?.name !== "registro_apri") return fail(-32602, `Strumento sconosciuto: ${params?.name}`);
+      const a = params?.arguments || {};
       try {
-        return ok(await registroApri(env, creds, params.arguments || {}));
+        if (params?.name === "registro_account") {
+          const s = await apiLogin(creds);
+          return ok({ content: [{ type: "text", text: "Login riuscito.\n\n" + JSON.stringify(redact(s.utente), null, 2) }] });
+        }
+        if (params?.name === "registro") {
+          const op = OPERAZIONI[a.cosa];
+          if (!op) return errTool(`Valore 'cosa' non valido. Usa: ${Object.keys(OPERAZIONI).join(", ")}.`);
+          const s = await apiLogin(creds);
+          const p = { ...(op.def || {}) };
+          if (op.params.includes("studente")) p.studente = s.studente;
+          for (const k of ["materia", "periodo", "mese", "nascondiVoti"]) {
+            if (a[k] != null && a[k] !== "" && op.params.includes(k)) p[k] = String(a[k]);
+          }
+          const r = await esegui(s.token, op.codice, p, PURL);
+          return ok({ content: [{ type: "text", text: formatRows(a.cosa, r) }] });
+        }
+        if (params?.name === "registro_operazione") {
+          if (!a.codice) return errTool("Specifica 'codice'.");
+          const s = await apiLogin(creds);
+          const base = a.base === "oneClickSchoolWs" ? WURL : PURL;
+          const p = { ...(a.parametri || {}) };
+          if (p.studente === "me" || p.studente === "") p.studente = s.studente;
+          const r = await esegui(s.token, a.codice, p, base, true);
+          return ok({ content: [{ type: "text", text: JSON.stringify(r, null, 2).slice(0, 18000) }] });
+        }
+        return fail(-32602, `Strumento sconosciuto: ${params?.name}`);
       } catch (err) {
-        return ok({ content: [{ type: "text", text: `Errore: ${err.message}` }], isError: true });
+        return errTool(`Errore: ${err.message}`);
       }
     }
     default:
       return fail(-32601, `Metodo non supportato: ${method}`);
   }
 }
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+function json(d, status = 200) {
+  return new Response(JSON.stringify(d), { status, headers: { "Content-Type": "application/json" } });
 }
 
-async function verificaCredenziali(env, creds) {
-  if (!creds.user || !creds.pass) throw new Error("Inserisci username e password.");
-  const browser = await puppeteer.launch(env.BROWSER);
-  try {
-    const p = await browser.newPage();
-    p.setDefaultTimeout(20000);
-    await login(p, creds);
-  } finally {
-    await browser.close().catch(() => {});
-  }
-}
+// ---------------- API client ----------------
+const UA = "OneClickSchool/" + APP_VERSION + " (Android)";
 
-// ---------------- Browser ----------------
-
-async function registroApri(env, creds, args) {
+async function apiLogin(creds) {
   if (!creds?.user || !creds?.pass) throw new Error("Credenziali mancanti: ricollega il connettore.");
-  if (!env.BROWSER) throw new Error("Binding BROWSER mancante: controlla wrangler.jsonc.");
-
-  const browser = await puppeteer.launch(env.BROWSER);
-  const log = [];
+  const res = await fetch(PURL + "/users/authenticate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA },
+    body: JSON.stringify({ username: creds.user, password: creds.pass, versione: APP_VERSION, device: DEVICE }),
+  });
+  const text = await res.text();
+  if (res.status === 403 || /Attention Required|you have been blocked/i.test(text)) {
+    throw new Error("Il server blocca le richieste dal cloud (protezione anti-bot). Serve l'esecuzione da rete residenziale.");
+  }
+  let data;
   try {
-    const page = await browser.newPage();
-    page.setDefaultTimeout(20000);
-    await login(page, creds);
-    log.push("Login eseguito.");
-
-    if (args.percorso) {
-      const target = new URL(args.percorso, BASE);
-      if (target.origin !== BASE) throw new Error("Il percorso deve restare su registro.orsoline.it.");
-      await page.goto(target.href, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await settle(page);
-      log.push(`Aperto ${target.pathname}.`);
-    }
-
-    for (const azione of args.azioni || []) {
-      if (azione.tipo === "clicca") {
-        const done = await clicca(page, azione.testo || "");
-        log.push(done ? `Cliccato "${azione.testo}".` : `NON trovato da cliccare: "${azione.testo}".`);
-        if (!done) break;
-      } else if (azione.tipo === "scrivi") {
-        const done = await scrivi(page, azione.testo || "", azione.valore ?? "");
-        log.push(done ? `Compilato "${azione.testo}".` : `NON trovato il campo: "${azione.testo}".`);
-        if (!done) break;
-      } else if (azione.tipo === "attendi") {
-        const ms = Math.min(Number(azione.valore) || 1000, 10000);
-        await sleep(ms);
-        log.push(`Atteso ${ms} ms.`);
-      }
-    }
-
-    const snapshot = await leggiPagina(page);
-    const content = [
-      {
-        type: "text",
-        text:
-          `${log.join("\n")}\n\nURL: ${page.url()}\n\n=== TESTO DELLA PAGINA ===\n${snapshot.text}\n\n` +
-          `=== ELEMENTI CLICCABILI ===\n${snapshot.clickable.join("\n") || "(nessuno)"}`,
-      },
-    ];
-    if (args.screenshot) {
-      const data = await page.screenshot({ type: "jpeg", quality: 60, fullPage: false, encoding: "base64" });
-      content.push({ type: "image", data, mimeType: "image/jpeg" });
-    }
-    return { content };
-  } finally {
-    await browser.close().catch(() => {});
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Risposta login non JSON (HTTP ${res.status}): ${text.slice(0, 300)}`);
   }
+  const token = data.token || data.Token || data.accessToken || data.access_token || (data.utente && (data.utente.token || data.utente.Token));
+  const utente = data.utente || data.Utente || data;
+  if (!token) {
+    if (data.autenticato === false || data.Autenticato === false || res.status === 401)
+      throw new Error("Login non riuscito: username o password errati.");
+    throw new Error(`Login: token non trovato. Risposta: ${JSON.stringify(data).slice(0, 400)}`);
+  }
+  const studente = utente?.Codice ?? utente?.codice ?? utente?.CodiceStudente ?? utente?.Id ?? utente?.id ?? "";
+  return { token, utente, studente: String(studente) };
 }
 
-async function login(page, creds) {
-  await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await settle(page);
-  // I campi del login vengono creati via JavaScript: aspetta che compaiano.
-  await page
-    .waitForFunction(
-      () =>
-        [...document.querySelectorAll("input")].filter(
-          (i) =>
-            !["hidden", "checkbox", "radio", "button", "submit"].includes(i.type) &&
-            i.getBoundingClientRect().width > 0
-        ).length >= 2,
-      { timeout: 20000, polling: 500 }
-    )
-    .catch(() => {});
-
-  const fields = [];
-  for (const el of await page.$$(
-    "input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=button]):not([type=submit])"
-  )) {
-    if (await el.boundingBox()) fields.push(el);
+async function esegui(token, codice, params, base, raw = false) {
+  const parametri = Object.entries(params).map(([nome, valore]) => ({ nome, valore: String(valore) }));
+  const res = await fetch(base + "/api/query/esegui", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      Authorization: "Bearer " + token,
+      "User-Agent": UA,
+    },
+    body: JSON.stringify({ codice, parametri }),
+  });
+  const text = await res.text();
+  if (res.status === 403 || /Attention Required|you have been blocked/i.test(text)) {
+    throw new Error("Il server blocca le richieste dal cloud (protezione anti-bot).");
   }
-  if (fields.length < 2) {
-    const info = await page
-      .evaluate(() => `titolo: "${document.title}" | testo: ${(document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 400)}`)
-      .catch(() => "");
-    throw new Error(`Pagina di login non riconosciuta (URL: ${page.url()} | ${info})`);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Risposta non JSON (HTTP ${res.status}) per ${codice}: ${text.slice(0, 300)}`);
   }
-  let pass = null;
-  for (const f of fields) {
-    if ((await f.evaluate((e) => e.type)) === "password") pass = f;
-  }
-  if (!pass) pass = fields[1];
-  const user = fields.find((f) => f !== pass);
-
-  await user.click({ clickCount: 3 });
-  await user.type(creds.user);
-  await pass.click({ clickCount: 3 });
-  await pass.type(creds.pass);
-
-  if (!(await clicca(page, "Log in"))) {
-    await pass.press("Enter");
-    await settle(page);
-  }
-
-  if (await trovaElemento(page, "Log in", true)) {
-    throw new Error("Login non riuscito: username o password errati.");
-  }
+  if (raw) return data;
+  if (data && (data.errore || data.Errore)) throw new Error(String(data.errore || data.Errore));
+  return data;
 }
 
-async function settle(page) {
-  await sleep(300);
-  await page.waitForNetworkIdle({ idleTime: 500, timeout: 10000 }).catch(() => {});
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// Cerca in tutti i frame l'elemento visibile il cui testo corrisponde (esatto prima, poi "contiene").
-async function trovaElemento(page, testo, soloEsatto = false) {
-  for (const frame of page.frames()) {
-    let handle;
-    try {
-      handle = await frame.evaluateHandle(
-        (t, exactOnly) => {
-          const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-          const target = norm(t);
-          if (!target) return null;
-          const visible = (el) => {
-            const r = el.getBoundingClientRect();
-            const s = getComputedStyle(el);
-            return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-          };
-          const sel =
-            "a,button,[role=button],[role=menuitem],[role=tab],[role=link],[onclick],input[type=button],input[type=submit],li,span,div,td,label";
-          let best = null;
-          let bestScore = Infinity;
-          for (const el of document.querySelectorAll(sel)) {
-            const txt = norm(el.innerText || el.value || el.getAttribute("aria-label") || el.title);
-            if (!txt) continue;
-            const exact = txt === target;
-            if (!exact && (exactOnly || !txt.includes(target))) continue;
-            if (!visible(el)) continue;
-            const interactive = el.matches(
-              "a,button,[role=button],[role=menuitem],[role=tab],[role=link],[onclick],input[type=button],input[type=submit]"
-            );
-            const score = (exact ? 0 : 1e6) + (interactive ? 0 : 1e4) + txt.length;
-            // a parità di punteggio vince l'elemento più interno (che viene dopo nel DOM)
-            if (score <= bestScore) {
-              best = el;
-              bestScore = score;
-            }
-          }
-          return best;
-        },
-        testo,
-        soloEsatto
-      );
-    } catch {
-      continue;
-    }
-    const el = handle.asElement();
-    if (el) return el;
+// ---------------- Formattazione ----------------
+function rowsOf(data) {
+  if (Array.isArray(data)) return data;
+  for (const k of ["Tabella1", "tabella1", "Table1", "righe", "rows", "dati", "Dati", "result", "Result"]) {
+    if (data && Array.isArray(data[k])) return data[k];
+  }
+  if (data && typeof data === "object") {
+    for (const v of Object.values(data)) if (Array.isArray(v)) return v;
   }
   return null;
 }
-
-async function clicca(page, testo) {
-  const el = await trovaElemento(page, testo);
-  if (!el) return false;
-  try {
-    await el.click();
-  } catch {
-    await el.evaluate((e) => e.click());
-  }
-  await settle(page);
-  return true;
+function formatRows(cosa, data) {
+  const rows = rowsOf(data);
+  if (!rows) return `Risposta per ${cosa}:\n` + JSON.stringify(data, null, 2).slice(0, 12000);
+  if (rows.length === 0) return `Nessun dato trovato per ${cosa}.`;
+  const lines = rows.slice(0, 200).map((r, i) => {
+    if (r && typeof r === "object") {
+      const parts = Object.entries(r)
+        .filter(([, v]) => v != null && v !== "")
+        .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`);
+      return `• ${parts.join(" | ")}`;
+    }
+    return `• ${r}`;
+  });
+  return `${cosa.toUpperCase()} (${rows.length} voci):\n` + lines.join("\n").slice(0, 16000);
 }
-
-async function scrivi(page, campo, valore) {
-  for (const frame of page.frames()) {
-    let handle;
-    try {
-      handle = await frame.evaluateHandle((c) => {
-        const norm = (s) => (s || "").replace(/\s+/g, " ").trim().toLowerCase();
-        const t = norm(c);
-        for (const f of document.querySelectorAll("input,textarea,select")) {
-          const r = f.getBoundingClientRect();
-          if (r.width === 0 || r.height === 0 || f.type === "hidden") continue;
-          const label = f.id ? document.querySelector(`label[for="${CSS.escape(f.id)}"]`) : null;
-          const keys = [f.placeholder, f.name, f.id, f.getAttribute("aria-label"), f.title, label && label.innerText].map(norm);
-          if (keys.some((k) => k && (k === t || k.includes(t)))) return f;
-        }
-        return null;
-      }, campo);
-    } catch {
-      continue;
-    }
-    const el = handle.asElement();
-    if (!el) continue;
-    const tag = await el.evaluate((e) => e.tagName);
-    if (tag === "SELECT") {
-      const ok = await el.evaluate((sel, v) => {
-        const want = v.trim().toLowerCase();
-        const opt = [...sel.options].find(
-          (o) => o.text.trim().toLowerCase() === want || o.value.toLowerCase() === want
-        ) || [...sel.options].find((o) => o.text.toLowerCase().includes(want));
-        if (!opt) return false;
-        sel.value = opt.value;
-        sel.dispatchEvent(new Event("change", { bubbles: true }));
-        return true;
-      }, String(valore));
-      await settle(page);
-      return ok;
-    }
-    await el.click({ clickCount: 3 });
-    await el.type(String(valore));
-    return true;
-  }
-  return false;
-}
-
-async function leggiPagina(page) {
-  const parts = [];
-  const clickable = [];
-  const seen = new Set();
-  for (const frame of page.frames()) {
-    try {
-      const r = await frame.evaluate(() => {
-        const visible = (el) => {
-          const b = el.getBoundingClientRect();
-          const s = getComputedStyle(el);
-          return b.width > 0 && b.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-        };
-        const items = [];
-        const sel =
-          "a,button,[role=button],[role=menuitem],[role=tab],[role=link],[onclick],input[type=button],input[type=submit]";
-        for (const el of document.querySelectorAll(sel)) {
-          if (!visible(el)) continue;
-          const t = (el.innerText || el.value || el.getAttribute("aria-label") || el.title || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 80);
-          if (!t) continue;
-          const href = el.getAttribute("href");
-          items.push(href && !href.startsWith("javascript") && href !== "#" ? `${t} → ${new URL(href, location.href).href}` : t);
-        }
-        return { text: document.body ? document.body.innerText : "", items };
-      });
-      if (r.text.trim()) parts.push(r.text.trim());
-      for (const it of r.items) {
-        if (!seen.has(it) && clickable.length < 200) {
-          seen.add(it);
-          clickable.push("- " + it);
-        }
-      }
-    } catch {
-      // frame non accessibile
-    }
-  }
-  let text = parts.join("\n\n---\n\n").replace(/\n{3,}/g, "\n\n");
-  if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + "\n[...testo troncato...]";
-  return { text, clickable };
+function redact(u) {
+  if (!u || typeof u !== "object") return u;
+  const c = { ...u };
+  for (const k of Object.keys(c)) if (/pass|token|secret/i.test(k)) c[k] = "***";
+  return c;
 }
