@@ -76,6 +76,22 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     annotations: { readOnlyHint: true },
   },
+  {
+    name: "diag",
+    title: "Sonda diagnostica",
+    description: "Avanzato. Fa una richiesta HTTP verso un host di registro.orsoline.it o *.sigma-sistemi.it e restituisce stato, header di risposta e inizio del corpo. Per capire la natura del blocco.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "URL completo (solo orsoline.it o sigma-sistemi.it)." },
+        method: { type: "string", enum: ["GET", "POST"], description: "Default GET." },
+        headers: { type: "object", description: "Header aggiuntivi." },
+        body: { type: "string", description: "Corpo (per POST)." },
+      },
+      required: ["url"],
+    },
+    annotations: {},
+  },
 ];
 
 // ---------------- OAuth provider ----------------
@@ -237,7 +253,7 @@ async function handle(msg, creds) {
       return ok({
         protocolVersion: SUPPORTED_VERSIONS.includes(params?.protocolVersion) ? params.protocolVersion : SUPPORTED_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "registro-orsoline", version: "3.1.0" },
+        serverInfo: { name: "registro-orsoline", version: "3.2.0" },
         instructions: "Registro elettronico via API. Usa lo strumento 'registro' con 'cosa' = voti/compiti/assenze/argomenti/comunicazioni. Niente limiti di browser.",
       });
     case "ping":
@@ -272,6 +288,32 @@ async function handle(msg, creds) {
           if (p.studente === "me" || p.studente === "") p.studente = s.studente;
           const r = await esegui(s, a.codice, p, true);
           return ok({ content: [{ type: "text", text: `base login: ${s.base}\n\n` + JSON.stringify(r, null, 2).slice(0, 18000) }] });
+        }
+        if (params?.name === "diag") {
+          let u;
+          try {
+            u = new URL(a.url);
+          } catch {
+            return errTool("URL non valido.");
+          }
+          if (!/(^|\.)orsoline\.it$|(^|\.)sigma-sistemi\.it$/.test(u.hostname)) {
+            return errTool("Host non consentito.");
+          }
+          const method2 = a.method === "POST" ? "POST" : "GET";
+          const headers = { ...(a.headers || {}) };
+          const init = { method: method2, headers };
+          if (method2 === "POST") init.body = a.body ?? "";
+          let outD;
+          try {
+            const res = await fetch(u.href, init);
+            const txt = await res.text();
+            const hdrs = {};
+            res.headers.forEach((v, k) => (hdrs[k] = v));
+            outD = { status: res.status, statusText: res.statusText, headers: hdrs, bodyStart: txt.slice(0, 700) };
+          } catch (e) {
+            outD = { error: String(e && e.message) };
+          }
+          return ok({ content: [{ type: "text", text: JSON.stringify(outD, null, 2).slice(0, 15000) }] });
         }
         return fail(-32602, `Strumento sconosciuto: ${params?.name}`);
       } catch (err) {
