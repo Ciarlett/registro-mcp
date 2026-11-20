@@ -8,8 +8,10 @@
 import { OAuthProvider, AuthorizationError } from "@cloudflare/workers-oauth-provider";
 
 // Endpoint della scuola (ricavati dalla configurazione dell'app, codice scuola "Dedalo").
-const PURL = "https://registro.orsoline.it/registroWs"; // operazioni registro (voti, assenze, ...)
-const WURL = "https://registro.orsoline.it/oneClickSchoolWs"; // servizi app
+// Ci sono due basi; non sapendo a priori quale ospita ogni rotta, il server le prova entrambe.
+const WURL = "https://registro.orsoline.it/oneClickSchoolWs"; // servizio app
+const PURL = "https://registro.orsoline.it/registroWs"; // servizio registro
+const BASI = [WURL, PURL];
 const APP_VERSION = "1.2.39";
 const DEVICE = "android";
 const SUPPORTED_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -61,7 +63,7 @@ const TOOLS = [
       properties: {
         codice: { type: "string", description: "Codice operazione, es. REVOTD_votiStudente." },
         parametri: { type: "object", description: "Coppie nome/valore dei parametri, es. { studente: \"123\", periodo: \"1\" }." },
-        base: { type: "string", enum: ["registroWs", "oneClickSchoolWs"], description: "Base da usare (default registroWs)." },
+        base: { type: "string", enum: ["registroWs", "oneClickSchoolWs"], description: "Forza una base (default: quella del login)." },
       },
       required: ["codice"],
     },
@@ -235,7 +237,7 @@ async function handle(msg, creds) {
       return ok({
         protocolVersion: SUPPORTED_VERSIONS.includes(params?.protocolVersion) ? params.protocolVersion : SUPPORTED_VERSIONS[0],
         capabilities: { tools: {} },
-        serverInfo: { name: "registro-orsoline", version: "3.0.0" },
+        serverInfo: { name: "registro-orsoline", version: "3.1.0" },
         instructions: "Registro elettronico via API. Usa lo strumento 'registro' con 'cosa' = voti/compiti/assenze/argomenti/comunicazioni. Niente limiti di browser.",
       });
     case "ping":
@@ -247,7 +249,7 @@ async function handle(msg, creds) {
       try {
         if (params?.name === "registro_account") {
           const s = await apiLogin(creds);
-          return ok({ content: [{ type: "text", text: "Login riuscito.\n\n" + JSON.stringify(redact(s.utente), null, 2) }] });
+          return ok({ content: [{ type: "text", text: `Login riuscito (base: ${s.base}, studente: ${s.studente}).\n\n` + JSON.stringify(redact(s.utente), null, 2) }] });
         }
         if (params?.name === "registro") {
           const op = OPERAZIONI[a.cosa];
@@ -258,17 +260,18 @@ async function handle(msg, creds) {
           for (const k of ["materia", "periodo", "mese", "nascondiVoti"]) {
             if (a[k] != null && a[k] !== "" && op.params.includes(k)) p[k] = String(a[k]);
           }
-          const r = await esegui(s.token, op.codice, p, PURL);
+          const r = await esegui(s, op.codice, p);
           return ok({ content: [{ type: "text", text: formatRows(a.cosa, r) }] });
         }
         if (params?.name === "registro_operazione") {
           if (!a.codice) return errTool("Specifica 'codice'.");
           const s = await apiLogin(creds);
-          const base = a.base === "oneClickSchoolWs" ? WURL : PURL;
+          if (a.base === "oneClickSchoolWs") s.base = WURL;
+          else if (a.base === "registroWs") s.base = PURL;
           const p = { ...(a.parametri || {}) };
           if (p.studente === "me" || p.studente === "") p.studente = s.studente;
-          const r = await esegui(s.token, a.codice, p, base, true);
-          return ok({ content: [{ type: "text", text: JSON.stringify(r, null, 2).slice(0, 18000) }] });
+          const r = await esegui(s, a.codice, p, true);
+          return ok({ content: [{ type: "text", text: `base login: ${s.base}\n\n` + JSON.stringify(r, null, 2).slice(0, 18000) }] });
         }
         return fail(-32602, `Strumento sconosciuto: ${params?.name}`);
       } catch (err) {
@@ -286,59 +289,71 @@ function json(d, status = 200) {
 // ---------------- API client ----------------
 const UA = "OneClickSchool/" + APP_VERSION + " (Android)";
 
-async function apiLogin(creds) {
-  if (!creds?.user || !creds?.pass) throw new Error("Credenziali mancanti: ricollega il connettore.");
-  const res = await fetch(PURL + "/users/authenticate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA },
-    body: JSON.stringify({ username: creds.user, password: creds.pass, versione: APP_VERSION, device: DEVICE }),
-  });
-  const text = await res.text();
-  if (res.status === 403 || /Attention Required|you have been blocked/i.test(text)) {
-    throw new Error("Il server blocca le richieste dal cloud (protezione anti-bot). Serve l'esecuzione da rete residenziale.");
-  }
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Risposta login non JSON (HTTP ${res.status}): ${text.slice(0, 300)}`);
-  }
-  const token = data.token || data.Token || data.accessToken || data.access_token || (data.utente && (data.utente.token || data.utente.Token));
-  const utente = data.utente || data.Utente || data;
-  if (!token) {
-    if (data.autenticato === false || data.Autenticato === false || res.status === 401)
-      throw new Error("Login non riuscito: username o password errati.");
-    throw new Error(`Login: token non trovato. Risposta: ${JSON.stringify(data).slice(0, 400)}`);
-  }
-  const studente = utente?.Codice ?? utente?.codice ?? utente?.CodiceStudente ?? utente?.Id ?? utente?.id ?? "";
-  return { token, utente, studente: String(studente) };
+function bloccato(text) {
+  return /Attention Required|you have been blocked|cf-error|cloudflare/i.test(text);
 }
 
-async function esegui(token, codice, params, base, raw = false) {
-  const parametri = Object.entries(params).map(([nome, valore]) => ({ nome, valore: String(valore) }));
-  const res = await fetch(base + "/api/query/esegui", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      Authorization: "Bearer " + token,
-      "User-Agent": UA,
-    },
-    body: JSON.stringify({ codice, parametri }),
-  });
+async function postJson(url, token, bodyObj) {
+  const headers = { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA };
+  if (token) headers.Authorization = "Bearer " + token;
+  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(bodyObj) });
   const text = await res.text();
-  if (res.status === 403 || /Attention Required|you have been blocked/i.test(text)) {
-    throw new Error("Il server blocca le richieste dal cloud (protezione anti-bot).");
+  if (res.status === 403 && bloccato(text)) {
+    throw new Error("Il server blocca le richieste dal cloud (protezione anti-bot). Serve l'esecuzione da rete residenziale.");
   }
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new Error(`Risposta non JSON (HTTP ${res.status}) per ${codice}: ${text.slice(0, 300)}`);
+  return { status: res.status, text };
+}
+
+async function apiLogin(creds) {
+  if (!creds?.user || !creds?.pass) throw new Error("Credenziali mancanti: ricollega il connettore.");
+  const body = { username: creds.user, password: creds.pass, versione: APP_VERSION, device: DEVICE };
+  const tried = [];
+  for (const base of BASI) {
+    const { status, text } = await postJson(base + "/users/authenticate", null, body);
+    tried.push(`${base} -> HTTP ${status}`);
+    if (status === 404) continue; // rotta non su questa base
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Risposta login non JSON (HTTP ${status}) da ${base}: ${text.slice(0, 200)}`);
+    }
+    const token = data.token || data.Token || data.accessToken || data.access_token || (data.utente && (data.utente.token || data.utente.Token));
+    const utente = data.utente || data.Utente || data;
+    if (!token) {
+      if (data.autenticato === false || data.Autenticato === false || status === 401 || status === 400)
+        throw new Error("Login non riuscito: username o password errati.");
+      throw new Error(`Login: token non trovato (HTTP ${status}). Risposta: ${JSON.stringify(data).slice(0, 300)}`);
+    }
+    const studente = utente?.Codice ?? utente?.codice ?? utente?.CodiceStudente ?? utente?.Id ?? utente?.id ?? "";
+    return { token, utente, studente: String(studente), base };
   }
-  if (raw) return data;
-  if (data && (data.errore || data.Errore)) throw new Error(String(data.errore || data.Errore));
-  return data;
+  throw new Error("Endpoint di login non trovato (404 su tutte le basi). Tentativi: " + tried.join("; "));
+}
+
+// Esegue un'operazione provando prima la base dell'auth, poi l'altra (le rotte dati
+// possono stare su una base diversa dal login).
+async function esegui(sess, codice, params, raw = false) {
+  const parametri = Object.entries(params).map(([nome, valore]) => ({ nome, valore: String(valore) }));
+  const ordine = [sess.base, ...BASI.filter((b) => b !== sess.base)];
+  let lastErr = "";
+  for (const base of ordine) {
+    const { status, text } = await postJson(base + "/api/query/esegui", sess.token, { codice, parametri });
+    if (status === 404) {
+      lastErr = `404 su ${base}`;
+      continue;
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Risposta non JSON (HTTP ${status}) per ${codice}: ${text.slice(0, 200)}`);
+    }
+    if (raw) return data;
+    if (data && (data.errore || data.Errore)) throw new Error(String(data.errore || data.Errore));
+    return data;
+  }
+  throw new Error(`Operazione ${codice}: rotta /api/query/esegui non trovata (${lastErr}).`);
 }
 
 // ---------------- Formattazione ----------------
