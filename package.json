@@ -1,18 +1,10 @@
 {
   "name": "registro-mcp",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
-  "description": "Server MCP per il registro elettronico registro.orsoline.it, con accesso tramite OAuth",
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
-  },
-  "dependencies": {
-    "@cloudflare/puppeteer": "^2.0.1",
-    "@cloudflare/workers-oauth-provider": "^1.2.4"
-  },
-  "devDependencies": {
-    "wrangler": "^4.165.0"
-  }
+  "description": "Server MCP per il registro elettronico registro.orsoline.it via API OneClickSchool",
+  "scripts": { "deploy": "wrangler deploy", "dev": "wrangler dev" },
+  "dependencies": { "@cloudflare/workers-oauth-provider": "^1.2.4" },
+  "devDependencies": { "wrangler": "^4.165.0" }
 }
